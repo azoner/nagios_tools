@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import sys
-import urllib
 
 STATE_OK = 0
 STATE_WARNING = 1
@@ -12,125 +11,79 @@ STATE_DEPENDENT = 4
 __version__ = "1.0.0"
 
 
+functionmap = {
+    "avg": {"label": "average", "function": lambda x: sum(x) / len(x)},
+    "last": {"label": "last", "function": lambda x: x[-1]},
+    "min": {"label": "minimum", "function": lambda x: min(x)},
+    "max": {"label": "maximum", "function": lambda x: max(x)},
+    "sum": {"label": "sum", "function": lambda x: sum(x)},
+}
+
+
+def get_http_data(url):
+    try:
+        # For Python 3.0 and later
+        from urllib.request import urlopen
+        response = urlopen(url)
+        return str(response.read(), encoding='utf8')
+    except ImportError:
+        # Fall back to Python 2's urllib2
+        from urllib2 import urlopen
+        response = urlopen(url)
+        return response.read()
+
+
 def pull_graphite_data(url):
     """Pull down raw data from Graphite"""
     # Make sure the url ends with '&rawData'
     if not url.endswith('&rawData'):
         url = url + '&rawData'
-    data = urllib.urlopen(url).read()
-    return data
+    data = get_http_data(url)
+    pieces = data.split("|")
+    counter = pieces[0].split(",")[0]
+    values = pieces[1].split(",")[:-1]
+    return (counter, values)
 
 
-def eval_graphite_data(data, seconds):
-    """Get the most recent correct value from the data"""
+def get_value(url, function='avg'):
+    """Get a single value from a Graphite metric"""
 
-    sample_period = int(data.split('|')[0].split(',')[-1])
-    all_data_points = data.split('|')[-1].split(',')
-
-    # Evaluate what graphite returned, should either be a float, or None
-    # First, if the number of seconds of data we want to examine is smaller or
-    # equals the graphite sample period, just grab the latest data point.
-    # If that data point is None, grab the one before it.
-    # If that is None too, return 0.0.
-    if seconds <= sample_period:
-        if eval(all_data_points[-1]):
-            data_value = float(all_data_points[-1])
-        elif eval(all_data_points[-2]):
-            data_value = float(all_data_points[-2])
-        else:
-            data_value = 0.0
+    (counter_name, text_values) = pull_graphite_data(url)
+    values = [float(x) for x in text_values if x != 'None']
+    if len(values) == 0:
+        raise Exception("Graphite returned an empty list of values")
     else:
-    # Second, if we requested more than on graphite sample period, work out how
-    # many sample periods we wanted (python always rounds division *down*)
-        data_points = (seconds / sample_period)
-        data_set = [float(x) for x in all_data_points[-data_points:] if eval(x)]
-        if data_set:
-            data_value = float(sum(data_set) / len(data_set))
-        else:
-            data_value = 0.0
-    return data_value
-
-
-def get_hw_value(url, seconds=0):
-    """Get the Holt-Winters value from a Graphite graph"""
-
-    data = pull_graphite_data(url)
-    for line in data.split():
-        if line.startswith('holtWintersConfidenceUpper'):
-            graphite_upper = eval_graphite_data(line, seconds)
-        elif line.startswith('holtWintersConfidenceLower'):
-            graphite_lower = eval_graphite_data(line, seconds)
-        else:
-            graphite_data = eval_graphite_data(line, seconds)
-
-    return graphite_data, graphite_lower, graphite_upper
-
-
-def get_value(url, seconds=0):
-    """Get the value from a Graphite graph"""
-
-    data = pull_graphite_data(url)
-    data_value = eval_graphite_data(data, seconds)
-    return data_value
+        value = functionmap[function]["function"](values)
+        return value
 
 
 def main(argv):
-# default
     import argparse
     parser = argparse.ArgumentParser(description='Check graphite data')
     parser.add_argument('-c', '--crit', type=float, help='Critical threshold')
     parser.add_argument('-w', '--warn', type=float, help='Warning threshold')
     parser.add_argument('-u', '--url', help='Graphite graph URL')
-    parser.add_argument('-r', '--reverse', action='store_true',
-            help='Alert when the value is UNDER warn/crit instead of OVER')
-    parser.add_argument('-s', '--seconds', type=int, help='Average over the last N seconds of data')
-    parser.add_argument('--d1', dest='diff1', help='Diff the latest values between two graphs, lower')
-    parser.add_argument('--d2', dest='diff2', help='Diff the latest values between two graphs, higher')
-    parser.add_argument('-W', '--holtwinters', action='store_true', help='Perform a Holt-Winters check')
-    parser.add_argument('-U', '--critupper', action='store_true',
-            help='Upper Holt-Winters band breach causes a crit, breaching lower band causes a warn')
-    parser.add_argument('-L', '--critlower', action='store_true',
-            help='Lower Holt-Winters band breach causes a crit, breaching upper band causes a warn')
+    parser.add_argument('-f', '--function', choices=['avg', 'min', 'max', 'last', 'sum'], default='avg', help='Function to run on retrieved values')
+    parser.add_argument('-r', '--reverse', action='store_true', help='Alert when the value is UNDER warn/crit instead of OVER')
+    parser.add_argument('-v', '--verbose', action='count')
+    parser.add_argument('-V', '--version', action='version', version='{prog} {version}'.format(prog=parser.prog, version=__version__))
 
-    #parser.add_argument('--verbose', '-v', action='count')
-    #parser.add_argument('--debug', '-d', action='store_true')
-    #parser.add_argument('--background', '-b', action='store_true')
-    #parser.add_argument('--test', '-t', action='store_true')
-    #parser.add_argument('--version', action='version', version='{prog} {version}'.format(prog=parser.prog, version=__version__))
-
-    #print '\t(If neither -U nor -L are given, we will always warn)'
     try:
         args = parser.parse_args()
     except Exception as err:
         args.print_help()
         sys.exit(STATE_UNKNOWN)
 
-    if not args.holtwinters and ((args.url is None) or (args.warn is None) or (args.crit is None)) \
-            and not args.diff1 and not args.diff2:
-        args.exit(STATE_UNKNOWN)
+    if ((args.url is None) or (args.warn is None) or (args.crit is None)):
+        sys.exit(STATE_UNKNOWN)
 
-    if (args.diff1 is None and args.diff2 is not None) or (args.diff1 is not None and args.diff2 is None):
-        args.exit(STATE_UNKNOWN, message='For the difference between two graphs, both are required')
+    try:
+        graphite_data = get_value(args.url, args.function)
+    except Exception as err:
+        print("Graphite query error: {0}".format(err))
+        sys.exit(STATE_UNKNOWN)
 
-    if args.holtwinters:
-        graphite_data, graphite_lower, graphite_upper = get_hw_value(args.url, args.seconds)
-        print 'Current value: %s, lower band: %s, upper band: %s' % \
-               (graphite_data, graphite_lower, graphite_upper)
-        if (graphite_data > graphite_upper) or (graphite_data < graphite_lower):
-            if args.critupper or args.critlower:
-                sys.exit(STATE_CRITICAL)
-            else:
-                sys.exit(STATE_WARNING)
-        else:
-            sys.exit(STATE_OK)
-    elif args.diff1 or args.diff2:
-        graphite_data1 = get_value(args.diff1, args.seconds)
-        graphite_data2 = get_value(args.diff2, args.seconds)
-        graphite_data = abs(graphite_data1 - graphite_data2)
-    else:
-        graphite_data = get_value(args.url, args.seconds)
-
-    print 'Current value: %s, warn threshold: %s, crit threshold: %s' % (graphite_data, args.warn, args.crit)
+    print('Current value: %s, warn threshold: %s, crit threshold: %s' % (graphite_data, args.warn, args.crit))
     if args.reverse:
         if args.crit >= graphite_data:
             sys.exit(STATE_CRITICAL)
